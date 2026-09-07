@@ -23,16 +23,22 @@ class SpacesMixin(ConfluenceClient):
 
         Returns:
             Dictionary containing space information with results and metadata
+
+        Raises:
+            ValueError: If the API response is malformed while a spaces filter is set
         """
         spaces = self.confluence.get_all_spaces(start=start, limit=limit)
         spaces_result = cast(dict[str, object], spaces)
         allowed_spaces = self._get_allowed_spaces()
-        if allowed_spaces is None or not isinstance(spaces_result, dict):
+        if allowed_spaces is None:
             return spaces_result
 
         results = spaces_result.get("results")
         if not isinstance(results, list):
-            return spaces_result
+            raise ValueError(
+                "Confluence get spaces returned a malformed response where "
+                "'results' is not a list"
+            )
 
         filtered_results = [
             space
@@ -57,6 +63,8 @@ class SpacesMixin(ConfluenceClient):
             Dictionary of space keys to space information
         """
         try:
+            allowed_spaces = self._get_allowed_spaces()
+
             # Use CQL to find content the user has contributed to
             cql = "contributor = currentUser() order by lastmodified DESC"
             results = self.confluence.cql(cql=cql, limit=limit)
@@ -92,7 +100,6 @@ class SpacesMixin(ConfluenceClient):
                     if url and url.startswith("/spaces/"):
                         space_key = url.split("/spaces/")[1].split("/")[0]
 
-                allowed_spaces = self._get_allowed_spaces()
                 if (
                     space_key
                     and (

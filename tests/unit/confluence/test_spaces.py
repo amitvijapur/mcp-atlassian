@@ -53,6 +53,16 @@ class TestSpacesMixin:
         assert result["results"] == [{"key": "TEST", "name": "Allowed"}]
         assert result["size"] == 1
 
+    def test_get_spaces_rejects_malformed_filtered_response(self, spaces_mixin):
+        spaces_mixin.config.spaces_filter = "TEST"
+        spaces_mixin.confluence.get_all_spaces.return_value = {
+            "results": {"key": "SECRET", "name": "Disallowed"},
+            "size": 1,
+        }
+
+        with pytest.raises(ValueError, match="'results' is not a list"):
+            spaces_mixin.get_spaces()
+
     def test_get_user_contributed_spaces_success(self, spaces_mixin):
         """Test getting spaces that the user has contributed to."""
         # Arrange
