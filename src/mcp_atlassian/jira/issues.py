@@ -30,6 +30,7 @@ logger = logging.getLogger("mcp-jira")
 
 # Friendly aliases that users may pass for the epic link custom field
 _EPIC_LINK_ALIASES = frozenset({"epickey", "epic_link", "epiclink", "epic link"})
+_EPIC_NAME_FIELD_SCHEMA = "com.pyxis.greenhopper.jira:gh-epic-label"
 
 
 class IssuesMixin(
@@ -803,14 +804,13 @@ class IssuesMixin(
         return issue_type.lower() in epic_names or "epic" in issue_type.lower()
 
     def _find_epic_issue_type_id(self, project_key: str) -> str | None:
-        """
-        Find the actual Epic issue type name for a project.
+        """Find the Epic issue type ID for a project.
 
         Args:
             project_key: The project key
 
         Returns:
-            The Epic issue type name if found, None otherwise
+            The Epic issue type ID if found, None otherwise
         """
         try:
             issue_types = self.get_project_issue_types(project_key)
@@ -818,12 +818,35 @@ class IssuesMixin(
             for issue_type in issue_types:
                 type_name = issue_type.get("name", "")
                 if type_name.lower() == "epic":
-                    return issue_type.get("id")
-            # Second pass: fallback to any type containing "epic"
+                    type_id = issue_type.get("id")
+                    return str(type_id) if type_id is not None else None
+
+            # Second pass: identify the type structurally from its create fields.
+            # Jira Server/DC localizes issue type names but keeps the GreenHopper
+            # Epic Name field schema stable.
+            for issue_type in issue_types:
+                if issue_type.get("subtask") is True:
+                    continue
+                type_id = issue_type.get("id")
+                if type_id is None:
+                    continue
+                type_id_str = str(type_id)
+                create_fields = self.get_create_fields(project_key, type_id_str)
+                for field in create_fields:
+                    schema = field.get("schema", {})
+                    if (
+                        isinstance(schema, dict)
+                        and schema.get("custom") == _EPIC_NAME_FIELD_SCHEMA
+                    ):
+                        return type_id_str
+
+            # Final pass: retain the existing localized-name heuristic when
+            # create metadata is unavailable (for example, some Cloud projects).
             for issue_type in issue_types:
                 type_name = issue_type.get("name", "")
                 if self._is_epic_issue_type(type_name):
-                    return issue_type.get("id")
+                    type_id = issue_type.get("id")
+                    return str(type_id) if type_id is not None else None
             return None
         except Exception as e:
             logger.warning(f"Could not get issue types for project {project_key}: {e}")
@@ -981,6 +1004,29 @@ class IssuesMixin(
                 f"Could not resolve epic link alias '{matched_alias}'="
                 f"{epic_key_value}. No epic link custom field discovered. "
                 f"Try using the exact custom field ID (e.g., customfield_10014)."
+            )
+
+    def _validate_parent_clear_supported(self, value: Any) -> None:
+        """Reject parent clearing on Jira Server/Data Center.
+
+        Jira Cloud accepts ``{"parent": null}`` for clearing a parent. Jira
+        Server/Data Center rejects the same request shape, so users must
+        update the Epic Link custom field directly instead.
+
+        Args:
+            value: The requested parent value.
+
+        Raises:
+            ValueError: If the value requests a parent clear on Server/DC.
+        """
+        if (value is None or value == "") and not self.config.is_cloud:
+            raise ValueError(
+                "Clearing an issue's parent with parent=None, parent='', or "
+                '{"parent": null} is supported only on Jira Cloud. Jira '
+                "Server/Data Center rejects this parent update format. To "
+                "clear an Epic Link on Server/DC, update its custom field "
+                'directly, for example {"customfield_10014": null}, using '
+                "the field ID returned by jira_search_fields."
             )
 
     def _add_assignee_to_fields(self, fields: dict[str, Any], assignee: str) -> None:
@@ -1196,6 +1242,16 @@ class IssuesMixin(
             kwargs_mutable = dict(kwargs)
             self._prepare_epic_link_fields(update_fields, kwargs_mutable)
 
+            # Jira Server/Data Center rejects the Cloud parent-clearing
+            # payload. Validate before any update or follow-up REST request.
+            if "parent" in kwargs_mutable:
+                self._validate_parent_clear_supported(kwargs_mutable["parent"])
+            elif "parent" in update_fields:
+                parent_value = update_fields["parent"]
+                self._validate_parent_clear_supported(parent_value)
+                if parent_value == "":
+                    update_fields["parent"] = None
+
             # Process kwargs
             for key, value in kwargs_mutable.items():
                 if key == "status":
@@ -1238,7 +1294,10 @@ class IssuesMixin(
                                 f"Could not update assignee: {str(e)}"
                             ) from e
                 elif key == "parent":
-                    if isinstance(value, dict) and value.get("key"):
+                    # Jira Cloud accepts an explicit null to clear the parent.
+                    if value is None or value == "":
+                        update_fields["parent"] = None
+                    elif isinstance(value, dict) and value.get("key"):
                         update_fields["parent"] = {"key": str(value["key"])}
                     elif isinstance(value, str) and value:
                         update_fields["parent"] = {"key": value}
